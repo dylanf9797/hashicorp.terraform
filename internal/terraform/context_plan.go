@@ -41,6 +41,8 @@ type PlanOpts struct {
 	// instance using its corresponding provider.
 	SkipRefresh bool
 
+	PlanCtx PlanContext
+
 	// PreDestroyRefresh indicated that this is being passed to a plan used to
 	// refresh the state immediately before a destroy plan.
 	// FIXME: This is a temporary fix to allow the pre-destroy refresh to
@@ -263,6 +265,14 @@ func (c *Context) PlanAndEval(config *configs.Config, prevRunState *states.State
 			`You are creating a plan with the -target option, which means that the result of this plan may not represent all of the changes requested by the current configuration.
 
 The -target option is not for routine use, and is provided only for exceptional situations such as recovering from errors or mistakes, or when Terraform specifically suggests to use it as part of an error message.`,
+		))
+	}
+
+	if opts.PlanCtx.LightMode {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Warning,
+			"Light plan mode is in effect",
+			`You are creating a plan with the light mode, which means that the result of this plan may not represent all of the changes that may have occurred outside of Terraform.`,
 		))
 	}
 
@@ -723,6 +733,7 @@ func (c *Context) planWalk(config *configs.Config, prevRunState *states.State, o
 		DeferralAllowed:            opts.DeferralAllowed,
 		ExternalDependencyDeferred: opts.ExternalDependencyDeferred,
 		Changes:                    changes,
+		PlanCtx:                    opts.PlanCtx,
 		MoveResults:                moveResults,
 		Overrides:                  opts.Overrides,
 		PlanTimeTimestamp:          timestamp,
@@ -906,6 +917,7 @@ func (c *Context) planGraph(config *configs.Config, prevRunState *states.State, 
 			Targets:                 opts.Targets,
 			ForceReplace:            opts.ForceReplace,
 			skipRefresh:             opts.SkipRefresh,
+			Ctx:                     opts.PlanCtx,
 			preDestroyRefresh:       opts.PreDestroyRefresh,
 			Operation:               walkPlan,
 			ExternalReferences:      opts.ExternalReferences,

@@ -91,6 +91,7 @@ type BuiltinEvalContext struct {
 	InstanceExpanderValue   *instances.Expander
 	MoveResultsValue        refactoring.MoveResults
 	OverrideValues          *mocking.Overrides
+	PlanContext             PlanContext
 }
 
 // BuiltinEvalContext implements EvalContext
@@ -109,6 +110,10 @@ func (ctx *BuiltinEvalContext) StopCtx() context.Context {
 	}
 
 	return ctx.StopContext
+}
+
+func (ctx *BuiltinEvalContext) PlanCtx() PlanContext {
+	return ctx.PlanContext
 }
 
 func (ctx *BuiltinEvalContext) Hook(fn func(Hook) (HookAction, error)) error {

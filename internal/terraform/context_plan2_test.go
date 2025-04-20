@@ -6847,3 +6847,146 @@ data "test_data_source" "foo" {
 
 	}
 }
+
+func TestContext2Plan_lightModePartialUpdate(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+			resource "test_object" "unchanged" {
+			value = "original1"
+			}
+
+			resource "test_object" "changed" {
+			value = "updated"
+			}
+`,
+	})
+
+	p := new(testing_provider.MockProvider)
+	p.GetProviderSchemaResponse = getProviderSchemaResponseFromProviderSchema(&providerSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_object": {
+				Attributes: map[string]*configschema.Attribute{
+					"value": {
+						Type:     cty.String,
+						Optional: true,
+					},
+				},
+			},
+		},
+	})
+
+	reqs := make([]string, 0)
+
+	p.ReadResourceFn = func(req providers.ReadResourceRequest) (resp providers.ReadResourceResponse) {
+		value := req.PriorState.GetAttr("value").AsString()
+		reqs = append(reqs, value)
+		resp.NewState = cty.ObjectVal(map[string]cty.Value{
+			"value": cty.StringVal("updated-from-cloud"),
+		})
+		return resp
+	}
+
+	state := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_object.unchanged"), &states.ResourceInstanceObjectSrc{
+			AttrsJSON: []byte(`{"value":"original1"}`),
+			Status:    states.ObjectReady,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+
+		s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_object.changed"), &states.ResourceInstanceObjectSrc{
+			AttrsJSON: []byte(`{"value":"original2"}`),
+			Status:    states.ObjectReady,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+	})
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	plan, diags := ctx.Plan(m, state, &PlanOpts{
+		Mode: plans.NormalMode,
+		PlanCtx: PlanContext{
+			LightMode: true,
+		},
+	})
+
+	tfdiags.AssertNoErrors(t, diags)
+
+	// Verify the plan changes
+	change := plan.Changes.ResourceInstance(mustResourceInstanceAddr("test_object.changed"))
+	if change.Action != plans.Update {
+		t.Fatalf("expected update action for 'test_object.changed', got: %v", change.Action)
+	}
+
+	unchanged := plan.Changes.ResourceInstance(mustResourceInstanceAddr("test_object.unchanged"))
+	if unchanged.Action != plans.NoOp {
+		t.Fatalf("expected no-op action for 'test_object.unchanged', got: %v", unchanged.Action)
+	}
+
+	// Verify the read resource request values
+	if cmp.Diff(reqs, []string{"original2"}) != "" {
+		t.Fatalf("unexpected read resource request values: %v", reqs)
+	}
+}
+
+func TestContext2Plan_lightModePartialUpdate2(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+			resource "test_object" "changed" {
+			value = "updated"
+			}
+`,
+	})
+
+	p := new(testing_provider.MockProvider)
+	p.GetProviderSchemaResponse = getProviderSchemaResponseFromProviderSchema(&providerSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_object": {
+				Attributes: map[string]*configschema.Attribute{
+					"value": {
+						Type:     cty.String,
+						Optional: true,
+					},
+				},
+			},
+		},
+	})
+
+	reqs := make([]string, 0)
+
+	p.ReadResourceFn = func(req providers.ReadResourceRequest) (resp providers.ReadResourceResponse) {
+		value := req.PriorState.GetAttr("value").AsString()
+		reqs = append(reqs, value)
+		resp.NewState = cty.ObjectVal(map[string]cty.Value{
+			"value": cty.StringVal("updated-from-cloud"),
+		})
+		return resp
+	}
+
+	state := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_object.changed"), &states.ResourceInstanceObjectSrc{
+			AttrsJSON: []byte(`{"value":"original2"}`),
+			Status:    states.ObjectReady,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+	})
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	plan, diags := ctx.Plan(m, state, &PlanOpts{
+		Mode:    plans.NormalMode,
+		PlanCtx: PlanContext{LightMode: true},
+	})
+
+	tfdiags.AssertNoErrors(t, diags)
+
+	// Verify the plan changes
+	change := plan.Changes.ResourceInstance(mustResourceInstanceAddr("test_object.changed"))
+	if change.Action != plans.Update {
+		t.Fatalf("expected update action for 'test_object.changed', got: %v", change.Action)
+	}
+}

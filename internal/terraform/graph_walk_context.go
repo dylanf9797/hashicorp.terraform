@@ -50,6 +50,7 @@ type ContextGraphWalker struct {
 	Config                  *configs.Config
 	PlanTimestamp           time.Time
 	Overrides               *mocking.Overrides
+	PlanCtx                 PlanContext
 	// Forget if set to true will cause the plan to forget all resources. This is
 	// only allowd in the context of a destroy plan.
 	Forget bool
@@ -138,6 +139,7 @@ func (w *ContextGraphWalker) EvalContext() EvalContext {
 		PrevRunStateValue:       w.PrevRunState,
 		Evaluator:               evaluator,
 		OverrideValues:          w.Overrides,
+		PlanContext:             w.PlanCtx,
 		forget:                  w.Forget,
 	}
 
