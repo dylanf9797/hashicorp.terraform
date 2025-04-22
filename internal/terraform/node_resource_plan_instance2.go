@@ -24,10 +24,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 )
 
-// ResourceState is implemented by any struct that will
-type ResourceState interface {
-	Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics)
-}
+type PlanResourceManager ResourceStateManager[*NodePlannableResourceInstance]
 
 // ResourceData holds the shared data during execution
 type ResourceData struct {
@@ -49,10 +46,11 @@ type ResourceData struct {
 
 func (n *NodePlannableResourceInstance) Execute2(ctx EvalContext, op walkOperation) tfdiags.Diagnostics {
 	stateManager := NewResourceStateManager(n)
-	stateManager.hooks = append(stateManager.hooks, func(state ResourceState, manager *ResourceStateManager) {
+	stateManager.AddHook(func(state ResourceState[*NodePlannableResourceInstance], manager *ResourceStateManager[*NodePlannableResourceInstance]) {
 		fmt.Printf("Executing step: %#v\n", state)
 	})
-	return stateManager.Execute(ctx)
+	init := &InitializationStep{stateManager.node.ResourceAddr().Resource.Mode}
+	return stateManager.Execute(init, ctx)
 }
 
 // InitializationStep is the first step in the state machine.
@@ -61,7 +59,7 @@ type InitializationStep struct {
 	Mode addrs.ResourceMode
 }
 
-func (s *InitializationStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *InitializationStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
 	// Initialize basic data
@@ -102,13 +100,12 @@ func (s *InitializationStep) Execute(ctx EvalContext, node *NodePlannableResourc
 		}
 	}
 
-	switch s.Mode {
-	case addrs.DataResourceMode:
+	// Data source planning goes through a different path
+	if s.Mode == addrs.DataResourceMode {
 		return &PlanDataSourceStep{}, diags
-	default:
-		// Continue
 	}
 
+	// Start importing process
 	if data.Importing {
 		return &ImportingStep{ImportTarget: node.importTarget}, diags
 	}
@@ -126,49 +123,49 @@ type ImportingStep struct {
 	ImportTarget cty.Value
 }
 
-func (s *ImportingStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *ImportingStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 	addr := node.ResourceInstanceAddr()
 	if s.ImportTarget.IsWhollyKnown() {
 		return &ProviderImportStep{ImportTarget: s.ImportTarget}, diags
-	} else {
-		// Mark as deferred without importing
-		data.Deferred = &providers.Deferred{
-			Reason: providers.DeferredReasonResourceConfigUnknown,
-		}
+	}
 
-		// Handle config generation
-		if node.Config == nil && len(node.generateConfigPath) > 0 {
-			// Then we're supposed to be generating configuration for this
-			// resource, but we can't because the configuration is unknown.
-			//
-			// Normally, the rest of this function would just be about
-			// planning the known configuration to make sure everything we
-			// do know about it is correct, but we can't even do that here.
-			//
-			// What we'll do is write out the address as being deferred with
-			// an entirely unknown value. Then we'll skip the rest of this
-			// function. (a) We're going to panic later when it complains
-			// about having no configuration, and (b) the rest of the
-			// function isn't doing anything as there is no configuration
-			// to validate.
+	// Unknown config. Mark as deferred without importing
+	data.Deferred = &providers.Deferred{
+		Reason: providers.DeferredReasonResourceConfigUnknown,
+	}
 
-			impliedType := data.ProviderSchema.ResourceTypes[addr.Resource.Resource.Type].Body.ImpliedType()
-			ctx.Deferrals().ReportResourceInstanceDeferred(addr, providers.DeferredReasonResourceConfigUnknown, &plans.ResourceInstanceChange{
-				Addr:         addr,
-				PrevRunAddr:  addr,
-				ProviderAddr: node.ResolvedProvider,
-				Change: plans.Change{
-					Action: plans.NoOp, // assume we'll get the config generation correct.
-					Before: cty.NullVal(impliedType),
-					After:  cty.UnknownVal(impliedType),
-					Importing: &plans.Importing{
-						Target: node.importTarget,
-					},
+	// Handle config generation
+	if node.Config == nil && len(node.generateConfigPath) > 0 {
+		// Then we're supposed to be generating configuration for this
+		// resource, but we can't because the configuration is unknown.
+		//
+		// Normally, the rest of this function would just be about
+		// planning the known configuration to make sure everything we
+		// do know about it is correct, but we can't even do that here.
+		//
+		// What we'll do is write out the address as being deferred with
+		// an entirely unknown value. Then we'll skip the rest of this
+		// function. (a) We're going to panic later when it complains
+		// about having no configuration, and (b) the rest of the
+		// function isn't doing anything as there is no configuration
+		// to validate.
+
+		impliedType := data.ProviderSchema.ResourceTypes[addr.Resource.Resource.Type].Body.ImpliedType()
+		ctx.Deferrals().ReportResourceInstanceDeferred(addr, providers.DeferredReasonResourceConfigUnknown, &plans.ResourceInstanceChange{
+			Addr:         addr,
+			PrevRunAddr:  addr,
+			ProviderAddr: node.ResolvedProvider,
+			Change: plans.Change{
+				Action: plans.NoOp, // assume we'll get the config generation correct.
+				Before: cty.NullVal(impliedType),
+				After:  cty.UnknownVal(impliedType),
+				Importing: &plans.Importing{
+					Target: node.importTarget,
 				},
-			})
-			return nil, diags
-		}
+			},
+		})
+		return nil, diags
 	}
 
 	return &SaveSnapshotStep{}, diags
@@ -179,7 +176,7 @@ type ProviderImportStep struct {
 	ImportTarget cty.Value
 }
 
-func (s *ProviderImportStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *ProviderImportStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	addr := node.ResourceInstanceAddr()
 	deferralAllowed := ctx.Deferrals().DeferralAllowed()
 	var diags tfdiags.Diagnostics
@@ -292,7 +289,7 @@ type PostImportStep struct {
 	HookResourceID HookResourceIdentity
 }
 
-func (s *PostImportStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *PostImportStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	addr := node.ResourceInstanceAddr()
 	deferred := data.Deferred
 	var diags tfdiags.Diagnostics
@@ -404,7 +401,7 @@ func (s *PostImportStep) Execute(ctx EvalContext, node *NodePlannableResourceIns
 // before refreshing the resource.
 type SaveSnapshotStep struct{}
 
-func (s *SaveSnapshotStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *SaveSnapshotStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
 	// Only write the state if the change isn't being deferred.
@@ -435,7 +432,7 @@ type ProviderRefreshStep struct {
 	Refresh bool
 }
 
-func (s *ProviderRefreshStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *ProviderRefreshStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
 	// we may need to detect a change in CreateBeforeDestroy to ensure it's
@@ -575,7 +572,7 @@ type RefreshOnlyStep struct {
 	prevInstanceState *states.ResourceInstanceObject
 }
 
-func (s *RefreshOnlyStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *RefreshOnlyStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
 	// In refresh-only mode we need to evaluate the for-each expression in
@@ -642,7 +639,7 @@ type PlanningStep struct {
 	Refreshed bool
 }
 
-func (s *PlanningStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *PlanningStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
 	// Initialize repetition data for replace triggers
@@ -736,7 +733,7 @@ type PostPlanDeferralStep struct {
 	Change     *plans.ResourceInstanceChange
 }
 
-func (s *PostPlanDeferralStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *PostPlanDeferralStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
 	deferrals := ctx.Deferrals()
@@ -823,7 +820,7 @@ type CheckingPostconditionsStep struct {
 	RepeatData instances.RepetitionData
 }
 
-func (s *CheckingPostconditionsStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *CheckingPostconditionsStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 	// Post-conditions might block completion. We intentionally do this
 	// _after_ writing the state/diff because we want to check against
@@ -845,39 +842,6 @@ func (s *CheckingPostconditionsStep) Execute(ctx EvalContext, node *NodePlannabl
 	return nil, diags
 }
 
-// ResourceStateManager orchestrates the state transitions
-type ResourceStateManager struct {
-	node  *NodePlannableResourceInstance
-	data  *ResourceData
-	hooks []func(ResourceState, *ResourceStateManager)
-}
-
-func NewResourceStateManager(node *NodePlannableResourceInstance) *ResourceStateManager {
-	return &ResourceStateManager{
-		node:  node,
-		data:  &ResourceData{},
-		hooks: []func(ResourceState, *ResourceStateManager){},
-	}
-}
-
-func (m *ResourceStateManager) Execute(ctx EvalContext) tfdiags.Diagnostics {
-	var diags tfdiags.Diagnostics
-
-	// Start with initial state
-	currentState := ResourceState(&InitializationStep{m.node.ResourceAddr().Resource.Mode})
-
-	// Execute state transitions until completion or error
-	for currentState != nil && !diags.HasErrors() {
-		for _, hook := range m.hooks {
-			hook(currentState, m)
-		}
-		var stateDiags tfdiags.Diagnostics
-		currentState, stateDiags = currentState.Execute(ctx, m.node, m.data)
-		diags = diags.Append(stateDiags)
-	}
-
-	return diags
-}
 func updateCreateBeforeDestroy(n *NodePlannableResourceInstance, currentState *states.ResourceInstanceObject) (updated bool) {
 	if n.Config != nil && n.Config.Managed != nil && currentState != nil {
 		newCBD := n.Config.Managed.CreateBeforeDestroy || n.ForceCreateBeforeDestroy

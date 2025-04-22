@@ -11,7 +11,7 @@ import (
 type PlanDataSourceStep struct {
 }
 
-func (s *PlanDataSourceStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState, tfdiags.Diagnostics) {
+func (s *PlanDataSourceStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 	addr := node.ResourceInstanceAddr()
 	deferrals := ctx.Deferrals()
