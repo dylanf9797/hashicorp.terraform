@@ -1,12 +1,10 @@
-// Copyright (c) HashiCorp, Inc.
-// SPDX-License-Identifier: BUSL-1.1
-
 package terraform
 
 import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strings"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
@@ -29,13 +27,14 @@ type PlanResourceManager ResourceStateManager[*NodePlannableResourceInstance]
 // ResourceData holds the shared data during execution
 type ResourceData struct {
 	// inputs
-	Addr                addrs.AbsResourceInstance
-	Importing           bool
-	ImportTarget        cty.Value
-	SkipProviderRefresh bool
-	SkipPlanning        bool
-	LightMode           bool
+	Addr                   addrs.AbsResourceInstance
+	Importing              bool
+	ImportTarget           cty.Value
+	PerformProviderRefresh bool
+	SkipPlanning           bool
+	LightMode              bool
 
+	// these are set during the execution
 	InstanceRefreshState *states.ResourceInstanceObject
 	Provider             providers.Interface
 	ProviderSchema       providers.ProviderSchema
@@ -47,7 +46,7 @@ type ResourceData struct {
 func (n *NodePlannableResourceInstance) Execute2(ctx EvalContext, op walkOperation) tfdiags.Diagnostics {
 	stateManager := NewResourceStateManager(n)
 	stateManager.AddHook(func(state ResourceState[*NodePlannableResourceInstance], manager *ResourceStateManager[*NodePlannableResourceInstance]) {
-		fmt.Printf("Executing step: %#v\n", state)
+		// fmt.Printf("Executing step: %#v\n", state)
 	})
 	init := &InitializationStep{stateManager.node.ResourceAddr().Resource.Mode}
 	return stateManager.Execute(init, ctx)
@@ -67,7 +66,7 @@ func (s *InitializationStep) Execute(ctx EvalContext, node *NodePlannableResourc
 	data.Importing = node.importTarget != cty.NilVal && !node.preDestroyRefresh
 	data.ImportTarget = node.importTarget
 	data.SkipPlanning = node.skipPlanChanges
-	data.SkipProviderRefresh = node.skipRefresh || ctx.PlanCtx().LightMode
+	data.PerformProviderRefresh = !(node.skipRefresh || ctx.PlanCtx().LightMode)
 	data.LightMode = ctx.PlanCtx().LightMode
 
 	// Determine check rule severity
@@ -105,9 +104,19 @@ func (s *InitializationStep) Execute(ctx EvalContext, node *NodePlannableResourc
 		return &PlanDataSourceStep{}, diags
 	}
 
-	// Start importing process
+	// Start importing process.
 	if data.Importing {
 		return &ImportingStep{ImportTarget: node.importTarget}, diags
+	}
+
+	// Check if we need to upgrade the schema. If we do, we must
+	// refresh the resource instance state to match the new schema.
+	upgradeRequired, diags := node.schemaUpgradeRequired(ctx, providerSchema, data.Addr)
+	if diags.HasErrors() {
+		return nil, diags
+	}
+	if upgradeRequired {
+		data.PerformProviderRefresh = upgradeRequired
 	}
 
 	// Read the resource instance from the state
@@ -126,11 +135,21 @@ type ImportingStep struct {
 func (s *ImportingStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 	addr := node.ResourceInstanceAddr()
+
+	// If the target was already in the state, we
+	// would not have gotten here, but let's double-check.
+	if s.ImportTarget == cty.NilVal {
+		return nil, diags
+	}
+
 	if s.ImportTarget.IsWhollyKnown() {
 		return &ProviderImportStep{ImportTarget: s.ImportTarget}, diags
 	}
 
-	// Unknown config. Mark as deferred without importing
+	// Unknown config. Mark as deferred without importing.
+	// We can only get here because we allowed unknowns in the
+	// import target, a behavior that is only supported when
+	// we allow deferrals.
 	data.Deferred = &providers.Deferred{
 		Reason: providers.DeferredReasonResourceConfigUnknown,
 	}
@@ -161,14 +180,18 @@ func (s *ImportingStep) Execute(ctx EvalContext, node *NodePlannableResourceInst
 				Before: cty.NullVal(impliedType),
 				After:  cty.UnknownVal(impliedType),
 				Importing: &plans.Importing{
-					Target: node.importTarget,
+					Target: s.ImportTarget,
 				},
 			},
 		})
 		return nil, diags
 	}
 
-	return &SaveSnapshotStep{}, diags
+	// We can go straight to planning the import, since we know it has no
+	// state, and thus nothing to refresh.
+	// We tell the planning step that it has been refreshed, so it can
+	// skip the refresh step.
+	return &PlanningStep{Refreshed: true}, diags
 }
 
 // ProviderImportStep handles the import of resources with the provider.
@@ -194,12 +217,8 @@ func (s *ProviderImportStep) Execute(ctx EvalContext, node *NodePlannableResourc
 		return nil, diags
 	}
 
-	schema := data.ResourceSchema
-	if schema.Body == nil {
-		// Should be caught during validation, so we don't bother with a pretty error here
-		diags = diags.Append(fmt.Errorf("provider does not support resource type for %q", node.Addr))
-		return nil, diags
-	}
+	importType := "ID"
+	var importValue string
 
 	var resp providers.ImportResourceStateResponse
 	if node.override != nil {
@@ -222,7 +241,7 @@ func (s *ProviderImportStep) Execute(ctx EvalContext, node *NodePlannableResourc
 
 		forEach, _, _ := evaluateForEachExpression(node.Config.ForEach, ctx, false)
 		keyData := EvalDataForInstanceKey(node.ResourceInstanceAddr().Resource.Key, forEach)
-		configVal, _, configDiags := ctx.EvaluateBlock(node.Config.Config, schema.Body, nil, keyData)
+		configVal, _, configDiags := ctx.EvaluateBlock(node.Config.Config, data.ResourceSchema.Body, nil, keyData)
 		if configDiags.HasErrors() {
 			// We have an overridden resource so we're definitely in a test and
 			// the users config is not valid. So give up and just report the
@@ -245,12 +264,12 @@ func (s *ProviderImportStep) Execute(ctx EvalContext, node *NodePlannableResourc
 			Value:             node.override.Values,
 			Range:             node.override.Range,
 			ComputedAsUnknown: false,
-		}, schema.Body)
+		}, data.ResourceSchema.Body)
 		resp = providers.ImportResourceStateResponse{
 			ImportedResources: []providers.ImportedResource{
 				{
 					TypeName: addr.Resource.Resource.Type,
-					State:    ephemeral.StripWriteOnlyAttributes(override, schema.Body),
+					State:    ephemeral.StripWriteOnlyAttributes(override, data.ResourceSchema.Body),
 				},
 			},
 			Diagnostics: overrideDiags.InConfigBody(node.Config.Config, absAddr.String()),
@@ -263,6 +282,8 @@ func (s *ProviderImportStep) Execute(ctx EvalContext, node *NodePlannableResourc
 				Identity:           s.ImportTarget,
 				ClientCapabilities: ctx.ClientCapabilities(),
 			})
+			importType = "Identity"
+			importValue = tfdiags.ObjectToString(s.ImportTarget)
 		} else {
 			// ID-based/string import
 			resp = provider.ImportResourceState(providers.ImportResourceStateRequest{
@@ -270,6 +291,7 @@ func (s *ProviderImportStep) Execute(ctx EvalContext, node *NodePlannableResourc
 				ID:                 s.ImportTarget.AsString(),
 				ClientCapabilities: ctx.ClientCapabilities(),
 			})
+			importValue = s.ImportTarget.AsString()
 		}
 	}
 
@@ -280,31 +302,13 @@ func (s *ProviderImportStep) Execute(ctx EvalContext, node *NodePlannableResourc
 		diags = diags.Append(deferring.UnexpectedProviderDeferralDiagnostic(node.Addr))
 	}
 	diags = diags.Append(resp.Diagnostics)
-	return &PostImportStep{ImportTarget: s.ImportTarget, Resp: resp, HookResourceID: hookResourceID}, diags
-}
-
-type PostImportStep struct {
-	ImportTarget   cty.Value
-	Resp           providers.ImportResourceStateResponse
-	HookResourceID HookResourceIdentity
-}
-
-func (s *PostImportStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
-	addr := node.ResourceInstanceAddr()
-	deferred := data.Deferred
-	var diags tfdiags.Diagnostics
-	importType := "ID"
-	var importValue string
-	if s.ImportTarget.Type().IsObjectType() {
-		importType = "Identity"
-		importValue = tfdiags.ObjectToString(s.ImportTarget)
-	} else {
-		importValue = s.ImportTarget.AsString()
+	if diags.HasErrors() {
+		return nil, diags
 	}
 
-	imported := s.Resp.ImportedResources
-
-	if len(imported) > 1 {
+	count := len(resp.ImportedResources)
+	switch {
+	case count > 1:
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Error,
 			"Multiple import states not supported",
@@ -314,11 +318,9 @@ func (s *PostImportStep) Execute(ctx EvalContext, node *NodePlannableResourceIns
 				importType, importValue,
 			),
 		))
-	}
-
-	if len(imported) == 0 {
+	case count == 0:
 		// Sanity check against the providers. If the provider defers the response, it may not have been able to return a state, so we'll only error if no deferral was returned.
-		if deferred == nil {
+		if resp.Deferred == nil {
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
 				"Import returned no resources",
@@ -340,12 +342,32 @@ func (s *PostImportStep) Execute(ctx EvalContext, node *NodePlannableResourceIns
 		// We skip the read and further validation since we make up the state
 		// of the imported resource anyways.
 		data.InstanceRefreshState = states.NewResourceInstanceObjectFromIR(state)
-		return &ProviderRefreshStep{Refresh: false}, nil
+		return &PlanningStep{}, nil
 	}
+
+	return &PostImportStep{
+		ImportType:        importType,
+		ImportValue:       importValue,
+		ImportedResources: resp.ImportedResources,
+		HookResourceID:    hookResourceID}, diags
+}
+
+type PostImportStep struct {
+	ImportType        string
+	ImportValue       string
+	ImportedResources []providers.ImportedResource
+	HookResourceID    HookResourceIdentity
+}
+
+func (s *PostImportStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
+	addr := node.ResourceInstanceAddr()
+	deferred := data.Deferred
+	var diags tfdiags.Diagnostics
+	imported := s.ImportedResources
 
 	absAddr := addr.Resource.Absolute(ctx.Path())
 	for _, obj := range imported {
-		log.Printf("[TRACE] PostImportStep: import %s %q produced instance object of type %s", absAddr.String(), importValue, obj.TypeName)
+		log.Printf("[TRACE] PostImportStep: import %s %q produced instance object of type %s", absAddr.String(), s.ImportValue, obj.TypeName)
 	}
 
 	// We can only call the hooks and validate the imported state if we have
@@ -368,7 +390,7 @@ func (s *PostImportStep) Execute(ctx EvalContext, node *NodePlannableResourceIns
 		func(path cty.Path) string {
 			return fmt.Sprintf(
 				"While attempting to import with %s %s, the provider %q returned a value for the write-only attribute \"%s%s\". Write-only attributes cannot be read back from the provider. This is a bug in the provider, which should be reported in the provider's own issue tracker.",
-				importType, importValue, node.ResolvedProvider, node.Addr, tfdiags.FormatCtyPath(path),
+				s.ImportType, s.ImportValue, node.ResolvedProvider, node.Addr, tfdiags.FormatCtyPath(path),
 			)
 		},
 		imported[0].State,
@@ -388,13 +410,13 @@ func (s *PostImportStep) Execute(ctx EvalContext, node *NodePlannableResourceIns
 			"Import returned null resource",
 			fmt.Sprintf("While attempting to import with %s %s, the provider"+
 				"returned an instance with no state.",
-				importType, importValue,
+				s.ImportType, s.ImportValue,
 			),
 		))
 
 	}
 	data.InstanceRefreshState = importedState
-	return &SaveSnapshotStep{}, diags
+	return &ProviderRefreshStep{Refresh: true}, diags
 }
 
 // SaveSnapshotStep saves a snapshot of the resource instance state
@@ -423,7 +445,7 @@ func (s *SaveSnapshotStep) Execute(ctx EvalContext, node *NodePlannableResourceI
 		}
 	}
 
-	return &ProviderRefreshStep{Refresh: !data.SkipProviderRefresh}, diags
+	return &ProviderRefreshStep{Refresh: data.PerformProviderRefresh}, diags
 }
 
 // ProviderRefreshStep handles refreshing the resource's state
@@ -480,69 +502,12 @@ func (s *ProviderRefreshStep) Execute(ctx EvalContext, node *NodePlannableResour
 			return nil, diags
 		}
 
-		// We are importing (maybe put in a new step?)
-		if data.Importing && data.ImportTarget.IsWhollyKnown() {
-			// verify the existence of the imported resource
-			if !refreshWasDeferred && data.InstanceRefreshState.Value.IsNull() {
-				var diags tfdiags.Diagnostics
-				diags = diags.Append(tfdiags.Sourceless(
-					tfdiags.Error,
-					"Cannot import non-existent remote object",
-					fmt.Sprintf(
-						"While attempting to import an existing object to %q, "+
-							"the provider detected that no object exists with the given id. "+
-							"Only pre-existing objects can be imported; check that the id "+
-							"is correct and that it is associated with the provider's "+
-							"configured region or endpoint, or use \"terraform apply\" to "+
-							"create a new remote object for this resource.",
-						node.Addr,
-					),
-				))
+		// Handle import validation and config generation if needed
+		if data.Importing {
+			importDiags := s.handleImportValidationAndConfigGen(node, data, refreshWasDeferred)
+			diags = diags.Append(importDiags)
+			if diags.HasErrors() {
 				return nil, diags
-			}
-
-			// If we're importing and generating config, generate it now. We only
-			// generate config if the import isn't being deferred. We should generate
-			// the configuration in the plan that the import is actually happening in.
-			if data.Deferred == nil && len(node.generateConfigPath) > 0 {
-				if node.Config != nil {
-					return nil, diags.Append(fmt.Errorf("tried to generate config for %s, but it already exists", node.Addr))
-				}
-
-				// Generate the HCL string first, then parse the HCL body from it.
-				// First we generate the contents of the resource block for use within
-				// the planning node. Then we wrap it in an enclosing resource block to
-				// pass into the plan for rendering.
-				generatedHCLAttributes, generatedDiags := node.generateHCLStringAttributes(node.Addr, data.InstanceRefreshState, data.ResourceSchema.Body)
-				diags = diags.Append(generatedDiags)
-
-				node.generatedConfigHCL = genconfig.WrapResourceContents(node.Addr, generatedHCLAttributes)
-
-				// parse the "file" as HCL to get the hcl.Body
-				synthHCLFile, hclDiags := hclsyntax.ParseConfig([]byte(generatedHCLAttributes), filepath.Base(node.generateConfigPath), hcl.Pos{Byte: 0, Line: 1, Column: 1})
-				diags = diags.Append(hclDiags)
-				if hclDiags.HasErrors() {
-					return nil, diags
-				}
-
-				// We have to do a kind of mini parsing of the content here to correctly
-				// mark attributes like 'provider' as hiddenode. We only care about the
-				// resulting content, so it's remain that gets passed into the resource
-				// as the config.
-				_, remain, resourceDiags := synthHCLFile.Body.PartialContent(configs.ResourceBlockSchema)
-				diags = diags.Append(resourceDiags)
-				if resourceDiags.HasErrors() {
-					return nil, diags
-				}
-
-				node.Config = &configs.Resource{
-					Mode:     addrs.ManagedResourceMode,
-					Type:     node.Addr.Resource.Resource.Type,
-					Name:     node.Addr.Resource.Resource.Name,
-					Config:   remain,
-					Managed:  &configs.ManagedResource{},
-					Provider: node.ResolvedProvider.Provider,
-				}
 			}
 		}
 	}
@@ -564,6 +529,85 @@ func (s *ProviderRefreshStep) Execute(ctx EvalContext, node *NodePlannableResour
 	}
 
 	return &PlanningStep{Refreshed: s.Refresh}, diags
+}
+
+// handleImportValidationAndConfigGen handles the import validation and config generation
+// after a resource has been refreshed.
+func (s *ProviderRefreshStep) handleImportValidationAndConfigGen(
+	node *NodePlannableResourceInstance,
+	data *ResourceData,
+	refreshWasDeferred bool,
+) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
+	// We only need to handle import validation and config generation
+	// when we're importing and the import target is wholly known
+	if !data.ImportTarget.IsWhollyKnown() {
+		return diags
+	}
+
+	if !refreshWasDeferred && data.InstanceRefreshState.Value.IsNull() {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Cannot import non-existent remote object",
+			fmt.Sprintf(
+				"While attempting to import an existing object to %q, "+
+					"the provider detected that no object exists with the given id. "+
+					"Only pre-existing objects can be imported; check that the id "+
+					"is correct and that it is associated with the provider's "+
+					"configured region or endpoint, or use \"terraform apply\" to "+
+					"create a new remote object for this resource.",
+				node.Addr,
+			),
+		))
+		return diags
+	}
+
+	// If we're importing and generating config, generate it now. We only
+	// generate config if the import isn't being deferred. We should generate
+	// the configuration in the plan that the import is actually happening in.
+	if data.Deferred == nil && len(node.generateConfigPath) > 0 {
+		if node.Config != nil {
+			return diags.Append(fmt.Errorf("tried to generate config for %s, but it already exists", node.Addr))
+		}
+
+		// Generate the HCL string first, then parse the HCL body from it.
+		// First we generate the contents of the resource block for use within
+		// the planning node. Then we wrap it in an enclosing resource block to
+		// pass into the plan for rendering.
+		generatedHCLAttributes, generatedDiags := node.generateHCLStringAttributes(node.Addr, data.InstanceRefreshState, data.ResourceSchema.Body)
+		diags = diags.Append(generatedDiags)
+
+		node.generatedConfigHCL = genconfig.WrapResourceContents(node.Addr, generatedHCLAttributes)
+
+		// parse the "file" as HCL to get the hcl.Body
+		synthHCLFile, hclDiags := hclsyntax.ParseConfig([]byte(generatedHCLAttributes), filepath.Base(node.generateConfigPath), hcl.Pos{Byte: 0, Line: 1, Column: 1})
+		diags = diags.Append(hclDiags)
+		if hclDiags.HasErrors() {
+			return diags
+		}
+
+		// We have to do a kind of mini parsing of the content here to correctly
+		// mark attributes like 'provider' as hiddenode. We only care about the
+		// resulting content, so it's remain that gets passed into the resource
+		// as the config.
+		_, remain, resourceDiags := synthHCLFile.Body.PartialContent(configs.ResourceBlockSchema)
+		diags = diags.Append(resourceDiags)
+		if resourceDiags.HasErrors() {
+			return diags
+		}
+
+		node.Config = &configs.Resource{
+			Mode:     addrs.ManagedResourceMode,
+			Type:     node.Addr.Resource.Resource.Type,
+			Name:     node.Addr.Resource.Resource.Name,
+			Config:   remain,
+			Managed:  &configs.ManagedResource{},
+			Provider: node.ResolvedProvider.Provider,
+		}
+	}
+
+	return diags
 }
 
 // RefreshOnlyStep handles the refresh-only planning mode
@@ -615,6 +659,14 @@ func (s *RefreshOnlyStep) Execute(ctx EvalContext, node *NodePlannableResourceIn
 
 	// Report deferral if needed
 	if data.Deferred != nil {
+		// Make sure we have a valid state before using it
+		var beforeValue cty.Value
+		if s.prevInstanceState != nil {
+			beforeValue = s.prevInstanceState.Value
+		} else {
+			beforeValue = cty.NullVal(data.InstanceRefreshState.Value.Type())
+		}
+
 		ctx.Deferrals().ReportResourceInstanceDeferred(
 			data.Addr,
 			data.Deferred.Reason,
@@ -624,13 +676,14 @@ func (s *RefreshOnlyStep) Execute(ctx EvalContext, node *NodePlannableResourceIn
 				ProviderAddr: node.ResolvedProvider,
 				Change: plans.Change{
 					Action: plans.Read,
-					Before: s.prevInstanceState.Value,
+					Before: beforeValue,
 					After:  data.InstanceRefreshState.Value,
 				},
 			},
 		)
 	}
 
+	// no more steps.
 	return nil, diags
 }
 
@@ -640,6 +693,9 @@ type PlanningStep struct {
 }
 
 func (s *PlanningStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
+	if strings.Contains(node.Addr.String(), "foou") {
+		fmt.Printf("PlanningStep: Ref: %v: %s\n", s.Refreshed, node.Addr.String())
+	}
 	var diags tfdiags.Diagnostics
 
 	// Initialize repetition data for replace triggers
@@ -691,6 +747,7 @@ func (s *PlanningStep) Execute(ctx EvalContext, node *NodePlannableResourceInsta
 		data.Deferred = planDeferred
 	}
 
+	// Update import metadata if needed
 	if data.Importing {
 		// There is a subtle difference between the import by identity
 		// and the import by ID. When importing by identity, we need to
@@ -703,20 +760,37 @@ func (s *PlanningStep) Execute(ctx EvalContext, node *NodePlannableResourceInsta
 		}
 	}
 
-	// FIXME: here we udpate the change to reflect the reason for
+	// FIXME: here we update the change to reflect the reason for
 	// replacement, but we still overload forceReplace to get the correct
 	// change planned.
 	if len(node.replaceTriggeredBy) > 0 {
 		change.ActionReason = plans.ResourceInstanceReplaceByTriggers
 	}
 
-	// in light mode, we did not refresh the state before planning, but the provider
-	// has deemed this resource to have configuration changes. We need to
-	// refresh the resource and re-plan appropriately.
-	doRefresh := !s.Refreshed && change.Action != plans.NoOp && data.LightMode
-	if doRefresh {
-		// go back to the refresh step
+	// Determine if we need to refresh and re-plan
+	needsRefresh := false
+	if !s.Refreshed && change.Action != plans.NoOp && data.LightMode {
+		// In light mode, if we didn't refresh before planning and the plan
+		// indicates changes are needed, we need to refresh and re-plan to
+		// ensure we have the most up-to-date state
+		needsRefresh = true
+	}
+
+	// Imports don't need a refresh as they already went through refresh
+	if data.Importing {
+		needsRefresh = false
+	}
+
+	if needsRefresh {
+		// Go back to the refresh step and try planning again afterward
 		return &ProviderRefreshStep{Refresh: true}, nil
+	}
+
+	// FIXME: here we update the change to reflect the reason for
+	// replacement, but we still overload forceReplace to get the correct
+	// change planned.
+	if len(node.replaceTriggeredBy) > 0 {
+		change.ActionReason = plans.ResourceInstanceReplaceByTriggers
 	}
 
 	return &PostPlanDeferralStep{

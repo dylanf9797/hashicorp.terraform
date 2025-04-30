@@ -85,6 +85,7 @@ func (n *NodePlannableResourceInstance) Execute(ctx EvalContext, op walkOperatio
 		// return n.managedResourceExecute(ctx)
 		return n.Execute2(ctx, op)
 	case addrs.DataResourceMode:
+		// return n.dataResourceExecute(ctx)
 		return n.Execute2(ctx, op)
 	case addrs.EphemeralResourceMode:
 		return n.ephemeralResourceExecute(ctx)

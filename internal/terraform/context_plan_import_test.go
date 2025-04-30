@@ -2217,3 +2217,71 @@ func TestContext2Plan_importIdentityModuleWithOptional(t *testing.T) {
 			tfdiags.ObjectToString(wantIdentity))
 	}
 }
+
+func TestContext2Plan_importResourceDeferred(t *testing.T) {
+	// This tests that a resource with unique import ID can be deferred
+	// with deferred actions is enabled.
+	addr := mustResourceInstanceAddr("test_object.a")
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+resource "test_object" "a" {
+  test_string = "foo"
+}
+
+import {
+  to   = test_object.a
+  id   = "${uuid()}"
+}
+`,
+	})
+
+	p := simpleMockProvider()
+	hook := new(MockHook)
+	ctx := testContext2(t, &ContextOpts{
+		Hooks: []Hook{hook},
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+	p.ReadResourceResponse = &providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"test_string": cty.StringVal("foo"),
+		}),
+	}
+	p.ImportResourceStateResponse = &providers.ImportResourceStateResponse{
+		ImportedResources: []providers.ImportedResource{
+			{
+				TypeName: "test_object",
+				State: cty.ObjectVal(map[string]cty.Value{
+					"test_string": cty.StringVal("foo"),
+				}),
+			},
+		},
+	}
+
+	diags := ctx.Validate(m, &ValidateOpts{})
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors\n%s", diags.Err().Error())
+	}
+
+	state := states.NewState()
+	plan, diags := ctx.Plan(m, state, &PlanOpts{
+		DeferralAllowed: true,
+		Mode:            plans.NormalMode,
+		PlanCtx: PlanContext{
+			LightMode: true,
+		},
+	})
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors\n%s", diags.Err().Error())
+	}
+
+	t.Run(addr.String(), func(t *testing.T) {
+		if len(plan.DeferredResources) != 1 {
+			t.Fatalf("expected one deferred resource, got %d", len(plan.DeferredResources))
+		}
+		if got, want := plan.DeferredResources[0].ChangeSrc.Addr, addr; !got.Equal(want) {
+			t.Errorf("wrong deferred resource address\ngot:  %s\nwant: %s", got, want)
+		}
+	})
+}
