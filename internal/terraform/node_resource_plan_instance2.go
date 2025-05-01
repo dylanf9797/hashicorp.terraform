@@ -45,11 +45,22 @@ type ResourceData struct {
 
 func (n *NodePlannableResourceInstance) Execute2(ctx EvalContext, op walkOperation) tfdiags.Diagnostics {
 	stateManager := NewResourceStateManager(n)
+	steps := []ResourceState[*NodePlannableResourceInstance]{}
 	stateManager.AddHook(func(state ResourceState[*NodePlannableResourceInstance], manager *ResourceStateManager[*NodePlannableResourceInstance]) {
-		// fmt.Printf("Executing step: %#v\n", state)
+		steps = append(steps, state)
 	})
-	init := &InitializationStep{stateManager.node.ResourceAddr().Resource.Mode}
-	return stateManager.Execute(init, ctx)
+	init := &InitializationStep{n.ResourceAddr().Resource.Mode}
+	diags := stateManager.Execute(init, ctx)
+
+	// Log the steps taken
+	str := strings.Builder{}
+	str.WriteString(fmt.Sprintf("Executing %s %s", n.Addr, op))
+	str.WriteString(fmt.Sprintf(" in %d steps:", len(steps)))
+	for _, step := range steps {
+		str.WriteString(fmt.Sprintf(" -> %T", step))
+	}
+	fmt.Printf("[TRACE] %s\n", str.String())
+	return diags
 }
 
 // InitializationStep is the first step in the state machine.
@@ -136,12 +147,13 @@ func (s *ImportingStep) Execute(ctx EvalContext, node *NodePlannableResourceInst
 	var diags tfdiags.Diagnostics
 	addr := node.ResourceInstanceAddr()
 
-	// If the target was already in the state, we
+	// If the target was already in the state, import target would be nil and we
 	// would not have gotten here, but let's double-check.
 	if s.ImportTarget == cty.NilVal {
 		return nil, diags
 	}
 
+	// Happy path: the import target id is known. Let's import it.
 	if s.ImportTarget.IsWhollyKnown() {
 		return &ProviderImportStep{ImportTarget: s.ImportTarget}, diags
 	}
@@ -159,32 +171,33 @@ func (s *ImportingStep) Execute(ctx EvalContext, node *NodePlannableResourceInst
 		// Then we're supposed to be generating configuration for this
 		// resource, but we can't because the configuration is unknown.
 		//
-		// Normally, the rest of this function would just be about
+		// Normally, the next step would just be about
 		// planning the known configuration to make sure everything we
 		// do know about it is correct, but we can't even do that here.
-		//
-		// What we'll do is write out the address as being deferred with
-		// an entirely unknown value. Then we'll skip the rest of this
-		// function. (a) We're going to panic later when it complains
+		// If we attempt to do that, (a) We're going to panic later when it complains
 		// about having no configuration, and (b) the rest of the
 		// function isn't doing anything as there is no configuration
 		// to validate.
-
+		//
+		// What we'll do instead is write out the address as being deferred with
+		// an entirely unknown value. Therefore we can skip the planning steps
+		// and go straight to the post-plan deferral step.
 		impliedType := data.ProviderSchema.ResourceTypes[addr.Resource.Resource.Type].Body.ImpliedType()
-		ctx.Deferrals().ReportResourceInstanceDeferred(addr, providers.DeferredReasonResourceConfigUnknown, &plans.ResourceInstanceChange{
-			Addr:         addr,
-			PrevRunAddr:  addr,
-			ProviderAddr: node.ResolvedProvider,
-			Change: plans.Change{
-				Action: plans.NoOp, // assume we'll get the config generation correct.
-				Before: cty.NullVal(impliedType),
-				After:  cty.UnknownVal(impliedType),
-				Importing: &plans.Importing{
-					Target: s.ImportTarget,
+		return &PostPlanDeferralStep{
+			Change: &plans.ResourceInstanceChange{
+				Addr:         addr,
+				PrevRunAddr:  addr,
+				ProviderAddr: node.ResolvedProvider,
+				Change: plans.Change{
+					Action: plans.NoOp, // assume we'll get the config generation correct.
+					Before: cty.NullVal(impliedType),
+					After:  cty.UnknownVal(impliedType),
+					Importing: &plans.Importing{
+						Target: s.ImportTarget,
+					},
 				},
 			},
-		})
-		return nil, diags
+		}, diags
 	}
 
 	// We can go straight to planning the import, since we know it has no
@@ -342,7 +355,7 @@ func (s *ProviderImportStep) Execute(ctx EvalContext, node *NodePlannableResourc
 		// We skip the read and further validation since we make up the state
 		// of the imported resource anyways.
 		data.InstanceRefreshState = states.NewResourceInstanceObjectFromIR(state)
-		return &PlanningStep{}, nil
+		return &PlanningStep{Refreshed: true}, nil
 	}
 
 	return &PostImportStep{
@@ -693,9 +706,6 @@ type PlanningStep struct {
 }
 
 func (s *PlanningStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
-	if strings.Contains(node.Addr.String(), "foou") {
-		fmt.Printf("PlanningStep: Ref: %v: %s\n", s.Refreshed, node.Addr.String())
-	}
 	var diags tfdiags.Diagnostics
 
 	// Initialize repetition data for replace triggers
@@ -770,8 +780,8 @@ func (s *PlanningStep) Execute(ctx EvalContext, node *NodePlannableResourceInsta
 	// Determine if we need to refresh and re-plan
 	needsRefresh := false
 	if !s.Refreshed && change.Action != plans.NoOp && data.LightMode {
-		// In light mode, if we didn't refresh before planning and the plan
-		// indicates changes are needed, we need to refresh and re-plan to
+		// In light mode, if we didn't refresh before planning but the provider
+		// has indicated that changes are needed, we need to refresh and re-plan to
 		// ensure we have the most up-to-date state
 		needsRefresh = true
 	}
