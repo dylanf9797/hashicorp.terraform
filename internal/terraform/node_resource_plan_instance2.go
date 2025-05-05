@@ -27,12 +27,11 @@ type PlanResourceManager ResourceStateManager[*NodePlannableResourceInstance]
 // ResourceData holds the shared data during execution
 type ResourceData struct {
 	// inputs
-	Addr                   addrs.AbsResourceInstance
-	Importing              bool
-	ImportTarget           cty.Value
-	PerformProviderRefresh bool
-	SkipPlanning           bool
-	LightMode              bool
+	Addr         addrs.AbsResourceInstance
+	Importing    bool
+	ImportTarget cty.Value
+	SkipPlanning bool
+	LightMode    bool
 
 	// these are set during the execution
 	InstanceRefreshState *states.ResourceInstanceObject
@@ -41,6 +40,7 @@ type ResourceData struct {
 	ResourceSchema       providers.Schema
 	Deferred             *providers.Deferred
 	CheckRuleSeverity    tfdiags.Severity
+	RefreshNeeded        bool
 }
 
 func (n *NodePlannableResourceInstance) Execute2(ctx EvalContext, op walkOperation) tfdiags.Diagnostics {
@@ -59,7 +59,7 @@ func (n *NodePlannableResourceInstance) Execute2(ctx EvalContext, op walkOperati
 	for _, step := range steps {
 		str.WriteString(fmt.Sprintf(" -> %T", step))
 	}
-	fmt.Printf("[TRACE] %s\n", str.String())
+	log.Printf("[TRACE] %s\n", str.String())
 	return diags
 }
 
@@ -77,8 +77,8 @@ func (s *InitializationStep) Execute(ctx EvalContext, node *NodePlannableResourc
 	data.Importing = node.importTarget != cty.NilVal && !node.preDestroyRefresh
 	data.ImportTarget = node.importTarget
 	data.SkipPlanning = node.skipPlanChanges
-	data.PerformProviderRefresh = !(node.skipRefresh || ctx.PlanCtx().LightMode)
 	data.LightMode = ctx.PlanCtx().LightMode
+	data.RefreshNeeded = !node.skipRefresh // by default, refresh is needed, unless asked to skip it. Any step that doesn't need it will set this to false.
 
 	// Determine check rule severity
 	data.CheckRuleSeverity = tfdiags.Error
@@ -127,7 +127,7 @@ func (s *InitializationStep) Execute(ctx EvalContext, node *NodePlannableResourc
 		return nil, diags
 	}
 	if upgradeRequired {
-		data.PerformProviderRefresh = upgradeRequired
+		data.RefreshNeeded = upgradeRequired
 	}
 
 	// Read the resource instance from the state
@@ -202,9 +202,7 @@ func (s *ImportingStep) Execute(ctx EvalContext, node *NodePlannableResourceInst
 
 	// We can go straight to planning the import, since we know it has no
 	// state, and thus nothing to refresh.
-	// We tell the planning step that it has been refreshed, so it can
-	// skip the refresh step.
-	return &PlanningStep{Refreshed: true}, diags
+	return &PlanningStep{}, diags
 }
 
 // ProviderImportStep handles the import of resources with the provider.
@@ -355,7 +353,8 @@ func (s *ProviderImportStep) Execute(ctx EvalContext, node *NodePlannableResourc
 		// We skip the read and further validation since we make up the state
 		// of the imported resource anyways.
 		data.InstanceRefreshState = states.NewResourceInstanceObjectFromIR(state)
-		return &PlanningStep{Refreshed: true}, nil
+		data.RefreshNeeded = false
+		return &PlanningStep{}, nil
 	}
 
 	return &PostImportStep{
@@ -429,7 +428,7 @@ func (s *PostImportStep) Execute(ctx EvalContext, node *NodePlannableResourceIns
 
 	}
 	data.InstanceRefreshState = importedState
-	return &ProviderRefreshStep{Refresh: true}, diags
+	return &ProviderRefreshStep{}, diags
 }
 
 // SaveSnapshotStep saves a snapshot of the resource instance state
@@ -458,21 +457,42 @@ func (s *SaveSnapshotStep) Execute(ctx EvalContext, node *NodePlannableResourceI
 		}
 	}
 
-	return &ProviderRefreshStep{Refresh: data.PerformProviderRefresh}, diags
+	// we may need to detect a change in CreateBeforeDestroy to ensure it's
+	// stored when we are not refreshing
+	updated := updateCreateBeforeDestroy(node, data.InstanceRefreshState)
+
+	// If we are in light mode, we may not need to refresh the state.
+	// If we find out that we have to after planning, the planning step will send us there.
+	if !data.RefreshNeeded || data.LightMode {
+		if updated {
+			// CreateBeforeDestroy must be set correctly in the state which is used
+			// to create the apply graph, so if we did not refresh the state make
+			// sure we still update any changes to CreateBeforeDestroy.
+			diags = diags.Append(node.writeResourceInstanceState(ctx, data.InstanceRefreshState, refreshState))
+			if diags.HasErrors() {
+				return nil, diags
+			}
+		}
+
+		// If we only want to refresh the state, then we can skip the
+		// planning phase.
+		if data.SkipPlanning {
+			return &RefreshOnlyStep{prevInstanceState: data.InstanceRefreshState}, diags
+		}
+
+		// Go straight to planning, since we don't need to refresh the state
+		return &PlanningStep{}, diags
+	}
+
+	return &ProviderRefreshStep{}, diags
 }
 
 // ProviderRefreshStep handles refreshing the resource's state
 // with the provider.
-type ProviderRefreshStep struct {
-	Refresh bool
-}
+type ProviderRefreshStep struct{}
 
 func (s *ProviderRefreshStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
-
-	// we may need to detect a change in CreateBeforeDestroy to ensure it's
-	// stored when we are not refreshing
-	updated := updateCreateBeforeDestroy(node, data.InstanceRefreshState)
 
 	// This is the state of the resource before we refresh the value in the provider, we need to keep track
 	// of this to report this as the before value if the refresh is deferred.
@@ -480,60 +500,49 @@ func (s *ProviderRefreshStep) Execute(ctx EvalContext, node *NodePlannableResour
 
 	var refreshWasDeferred bool
 	// Perform the refresh
-	if s.Refresh {
-		refreshedState, refreshDeferred, refreshDiags := node.refresh(
-			ctx, states.NotDeposed, data.InstanceRefreshState, ctx.Deferrals().DeferralAllowed(),
+	refreshedState, refreshDeferred, refreshDiags := node.refresh(
+		ctx, states.NotDeposed, data.InstanceRefreshState, ctx.Deferrals().DeferralAllowed(),
+	)
+	diags = diags.Append(refreshDiags)
+	if diags.HasErrors() {
+		return nil, diags
+	}
+
+	data.InstanceRefreshState = refreshedState
+
+	if data.InstanceRefreshState != nil {
+		// When refreshing we start by merging the stored dependencies and
+		// the configured dependencies. The configured dependencies will be
+		// stored to state once the changes are applied. If the plan
+		// results in no changes, we will re-write these dependencies
+		// below.
+		data.InstanceRefreshState.Dependencies = mergeDeps(
+			node.Dependencies, data.InstanceRefreshState.Dependencies,
 		)
-		diags = diags.Append(refreshDiags)
-		if diags.HasErrors() {
-			return nil, diags
-		}
-
-		data.InstanceRefreshState = refreshedState
-
-		if data.InstanceRefreshState != nil {
-			// When refreshing we start by merging the stored dependencies and
-			// the configured dependencies. The configured dependencies will be
-			// stored to state once the changes are applied. If the plan
-			// results in no changes, we will re-write these dependencies
-			// below.
-			data.InstanceRefreshState.Dependencies = mergeDeps(
-				node.Dependencies, data.InstanceRefreshState.Dependencies,
-			)
-		}
-
-		if data.Deferred == nil && refreshDeferred != nil {
-			data.Deferred = refreshDeferred
-		}
-		refreshWasDeferred = refreshDeferred != nil
-
-		if data.Deferred == nil {
-			diags = diags.Append(node.writeResourceInstanceState(ctx, data.InstanceRefreshState, refreshState))
-		}
-
-		if diags.HasErrors() {
-			return nil, diags
-		}
-
-		// Handle import validation and config generation if needed
-		if data.Importing {
-			importDiags := s.handleImportValidationAndConfigGen(node, data, refreshWasDeferred)
-			diags = diags.Append(importDiags)
-			if diags.HasErrors() {
-				return nil, diags
-			}
-		}
 	}
 
-	if !s.Refresh && updated {
-		// CreateBeforeDestroy must be set correctly in the state which is used
-		// to create the apply graph, so if we did not refresh the state make
-		// sure we still update any changes to CreateBeforeDestroy.
+	if data.Deferred == nil && refreshDeferred != nil {
+		data.Deferred = refreshDeferred
+	}
+	refreshWasDeferred = refreshDeferred != nil
+
+	if data.Deferred == nil {
 		diags = diags.Append(node.writeResourceInstanceState(ctx, data.InstanceRefreshState, refreshState))
+	}
+	if diags.HasErrors() {
+		return nil, diags
+	}
+
+	// Handle import validation and config generation if needed
+	if data.Importing {
+		importDiags := s.handleImportValidationAndConfigGen(node, data, refreshWasDeferred)
+		diags = diags.Append(importDiags)
 		if diags.HasErrors() {
 			return nil, diags
 		}
 	}
+
+	data.RefreshNeeded = false // we just refreshed, we shouldn't need to refresh again
 
 	// If we only want to refresh the state, then we can skip the
 	// planning phase.
@@ -541,7 +550,7 @@ func (s *ProviderRefreshStep) Execute(ctx EvalContext, node *NodePlannableResour
 		return &RefreshOnlyStep{prevInstanceState: preRefreshInstanceState}, diags
 	}
 
-	return &PlanningStep{Refreshed: s.Refresh}, diags
+	return &PlanningStep{}, diags
 }
 
 // handleImportValidationAndConfigGen handles the import validation and config generation
@@ -701,9 +710,7 @@ func (s *RefreshOnlyStep) Execute(ctx EvalContext, node *NodePlannableResourceIn
 }
 
 // PlanningStep handles the planning phase
-type PlanningStep struct {
-	Refreshed bool
-}
+type PlanningStep struct{}
 
 func (s *PlanningStep) Execute(ctx EvalContext, node *NodePlannableResourceInstance, data *ResourceData) (ResourceState[*NodePlannableResourceInstance], tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
@@ -778,22 +785,13 @@ func (s *PlanningStep) Execute(ctx EvalContext, node *NodePlannableResourceInsta
 	}
 
 	// Determine if we need to refresh and re-plan
-	needsRefresh := false
-	if !s.Refreshed && change.Action != plans.NoOp && data.LightMode {
-		// In light mode, if we didn't refresh before planning but the provider
-		// has indicated that changes are needed, we need to refresh and re-plan to
-		// ensure we have the most up-to-date state
-		needsRefresh = true
-	}
-
-	// Imports don't need a refresh as they already went through refresh
-	if data.Importing {
-		needsRefresh = false
-	}
-
-	if needsRefresh {
-		// Go back to the refresh step and try planning again afterward
-		return &ProviderRefreshStep{Refresh: true}, nil
+	// In light mode, if we didn't refresh before planning but the provider
+	// has indicated that changes are needed, we need to refresh and re-plan to
+	// ensure we have the most up-to-date state
+	refreshChangedResource := data.RefreshNeeded && change.Action != plans.NoOp && data.LightMode
+	if refreshChangedResource {
+		// Go back to the refresh step and plan again
+		return &ProviderRefreshStep{}, nil
 	}
 
 	// FIXME: here we update the change to reflect the reason for
