@@ -210,16 +210,16 @@ func (c *ApplyCommand) PrepareBackend(planFile *planfile.WrappedPlanFile, args *
 			))
 			return nil, diags
 		}
-		if plan.Backend.Config == nil {
+		if plan.Backend.Config == nil && plan.StateStore.Config == nil {
 			// Should never happen; always indicates a bug in the creation of the plan file
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
 				"Failed to read plan from plan file",
-				"The given plan file does not have a valid backend configuration. This is a bug in the Terraform command that generated this plan file.",
+				"The given plan file does not have either a valid backend or state_store configuration. This is a bug in the Terraform command that generated this plan file.",
 			))
 			return nil, diags
 		}
-		be, beDiags = c.BackendForLocalPlan(plan.Backend)
+		be, beDiags = c.BackendForLocalPlan(plan)
 	} else {
 		// Both new plans and saved cloud plans load their backend from config.
 		backendConfig, configDiags := c.loadBackendConfig(".")
