@@ -1543,17 +1543,19 @@ func TestMetaBackend_planLocal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	backendConfig := plans.Backend{
-		Type:      "local",
-		Config:    backendConfigRaw,
-		Workspace: "default",
+	plan := &plans.Plan{
+		Backend: plans.Backend{
+			Type:      "local",
+			Config:    backendConfigRaw,
+			Workspace: "default",
+		},
 	}
 
 	// Setup the meta
 	m := testMetaBackend(t, nil)
 
 	// Get the backend
-	b, diags := m.BackendForLocalPlan(backendConfig)
+	b, diags := m.BackendForLocalPlan(plan)
 	if diags.HasErrors() {
 		t.Fatal(diags.Err())
 	}
@@ -1634,10 +1636,12 @@ func TestMetaBackend_planLocalStatePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plannedBackend := plans.Backend{
-		Type:      "local",
-		Config:    backendConfigRaw,
-		Workspace: "default",
+	plan := &plans.Plan{
+		Backend: plans.Backend{
+			Type:      "local",
+			Config:    backendConfigRaw,
+			Workspace: "default",
+		},
 	}
 
 	// Create an alternate output path
@@ -1654,7 +1658,7 @@ func TestMetaBackend_planLocalStatePath(t *testing.T) {
 	m.stateOutPath = statePath
 
 	// Get the backend
-	b, diags := m.BackendForLocalPlan(plannedBackend)
+	b, diags := m.BackendForLocalPlan(plan)
 	if diags.HasErrors() {
 		t.Fatal(diags.Err())
 	}
@@ -1733,17 +1737,19 @@ func TestMetaBackend_planLocalMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	backendConfig := plans.Backend{
-		Type:      "local",
-		Config:    backendConfigRaw,
-		Workspace: "default",
+	plan := &plans.Plan{
+		Backend: plans.Backend{
+			Type:      "local",
+			Config:    backendConfigRaw,
+			Workspace: "default",
+		},
 	}
 
 	// Setup the meta
 	m := testMetaBackend(t, nil)
 
 	// Get the backend
-	b, diags := m.BackendForLocalPlan(backendConfig)
+	b, diags := m.BackendForLocalPlan(plan)
 	if diags.HasErrors() {
 		t.Fatal(diags.Err())
 	}
