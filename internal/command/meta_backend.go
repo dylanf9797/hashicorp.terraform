@@ -430,7 +430,7 @@ func (m *Meta) Operation(b backend.Backend, vt arguments.ViewType) *backendrun.O
 		// So we do nothing here.
 	case m.backendConfigState != nil && m.stateStoreConfigState != nil:
 		// Both set
-		panic(fmt.Sprintf("failed to encode backend configuration for plan: both backend and state_store data present but they are mutually exclusive"))
+		panic("failed to encode backend configuration for plan: both backend and state_store data present but they are mutually exclusive")
 	case m.backendConfigState != nil:
 		planOutBackend, err = m.backendConfigState.Plan(schema, workspace)
 		if err != nil {
