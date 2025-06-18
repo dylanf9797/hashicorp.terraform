@@ -426,8 +426,8 @@ func (m *Meta) Operation(b backend.Backend, vt arguments.ViewType) *backendrun.O
 	var planOutStateStore *plans.StateStore
 	switch {
 	case m.backendConfigState == nil && m.stateStoreConfigState == nil:
-		// Neither set
-		panic(fmt.Sprintf("failed to encode backend configuration for plan: neither backend nor state_store data present"))
+		// It is valid for neither to be set.
+		// So we do nothing here.
 	case m.backendConfigState != nil && m.stateStoreConfigState != nil:
 		// Both set
 		panic(fmt.Sprintf("failed to encode backend configuration for plan: both backend and state_store data present but they are mutually exclusive"))
