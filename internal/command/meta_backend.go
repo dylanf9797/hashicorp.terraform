@@ -1804,13 +1804,26 @@ func (m *Meta) assertSupportedCloudInitOptions(mode cloud.ConfigChangeMode) tfdi
 
 func (m *Meta) getStateStoreProviderFactory(config *configs.StateStore) (providers.Factory, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
-
+	if config == nil {
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Missing state_store configuration",
+			Detail:   "While initializing the state store Terraform encountered a nil state_store configuration. This is an error in Terraform and should be reported.",
+		})
+		return nil, diags
+	}
 	if config.ProviderAddr.IsZero() {
 		// This should not happen; this data is populated when parsing config,
 		// even for builtin providers
-		panic(fmt.Sprintf("unknown provider while beginning to initialize state store %q from provider %q",
-			config.Type,
-			config.Provider.Name))
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Missing state_store provider data",
+			Detail: fmt.Sprintf("While initializing the state store %q from provider %s (%q) Terraform encountered missing information about the linked provider. This is an error in Terraform and should be reported.",
+				config.Type,
+				config.Provider.Name,
+				config.ProviderAddr),
+		})
+		return nil, diags
 	}
 
 	ctxOpts, err := m.contextOpts()

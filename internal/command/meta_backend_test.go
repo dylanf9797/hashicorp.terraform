@@ -2397,6 +2397,129 @@ func TestMetaBackend_configureStateStoreVariableUse(t *testing.T) {
 	}
 }
 
+func TestMeta_getStateStoreProviderFactory(t *testing.T) {
+	t.Run("defends against missing state_store config", func(t *testing.T) {
+		m := testMetaBackend(t, nil)
+		var config *configs.StateStore = nil
+		factory, diags := m.getStateStoreProviderFactory(config)
+		if !diags.HasErrors() {
+			t.Fatal("expected error but got none")
+		}
+		expectedErr := "Missing state_store configuration"
+		if !strings.Contains(diags.Err().Error(), expectedErr) {
+			t.Fatalf("expected error to include %q but it is missing: %q",
+				expectedErr,
+				diags.Err())
+		}
+		if factory != nil {
+			t.Fatal("unexpected factory returned")
+		}
+	})
+
+	t.Run("defends against missing provider addr data", func(t *testing.T) {
+		m := testMetaBackend(t, nil)
+		config := &configs.StateStore{
+			Type: "foo_bar",
+			Provider: &configs.Provider{
+				Name: "foo",
+			},
+			// ProviderAddr is not set
+		}
+		factory, diags := m.getStateStoreProviderFactory(config)
+		if !diags.HasErrors() {
+			t.Fatal("expected error but got none")
+		}
+		expectedErr := "Missing state_store provider data"
+		if !strings.Contains(diags.Err().Error(), expectedErr) {
+			t.Fatalf("expected error to include %q but it is missing: %q",
+				expectedErr,
+				diags.Err())
+		}
+		if factory != nil {
+			t.Fatal("unexpected factory returned")
+		}
+	})
+
+	t.Run("retrieves a matching factory from those available", func(t *testing.T) {
+		m := testMetaBackend(t, nil)
+
+		// Make the Meta report it has a factory for 'foo'
+		fooProviderAddress := addrs.NewDefaultProvider("foo")
+		fooProvider := new(testing_provider.MockProvider)
+		fooFactory := providers.FactoryFixed(fooProvider)
+		m.testingOverrides = &testingOverrides{
+			Providers: map[addrs.Provider]providers.Factory{
+				fooProviderAddress: fooFactory,
+			},
+		}
+
+		config := &configs.StateStore{
+			Type: "foo_bar",
+			Provider: &configs.Provider{
+				Name: "foo",
+			},
+			ProviderAddr: fooProviderAddress,
+		}
+
+		factory, diags := m.getStateStoreProviderFactory(config)
+		if diags.HasErrors() {
+			t.Fatalf("unexpected error: %q", diags.Err())
+		}
+		if factory == nil {
+			t.Fatal("expected a factory to be returned")
+		}
+
+		// Assert the factory returns the mock provider
+		p, err := factory()
+		if err != nil {
+			t.Fatal("unexpected err: ", err)
+		}
+		_ = p.GetProviderSchema()
+		if !fooProvider.GetProviderSchemaCalled {
+			// fooProvider.GetProviderSchemaCalled should be true
+			t.Fatal("the provider returned from the factor is not the expected provider")
+		}
+	})
+
+	// This error would only be surfaced if there are issues in parsing logic, which is where a matching
+	// required_providers entry is asserted, or if calling code is incorrect.
+	t.Run("returns an error if there is no matching provider", func(t *testing.T) {
+		m := testMetaBackend(t, nil)
+
+		// Make the Meta report it has a factory for 'not_foo'
+		notFooProviderAddress := addrs.NewDefaultProvider("not-foo")
+		notFooProvider := new(testing_provider.MockProvider)
+		notFooFactory := providers.FactoryFixed(notFooProvider)
+		m.testingOverrides = &testingOverrides{
+			Providers: map[addrs.Provider]providers.Factory{
+				notFooProviderAddress: notFooFactory,
+			},
+		}
+
+		config := &configs.StateStore{
+			Type: "foo_bar",
+			Provider: &configs.Provider{
+				Name: "foo",
+			},
+			ProviderAddr: addrs.NewDefaultProvider("foo"),
+		}
+
+		factory, diags := m.getStateStoreProviderFactory(config)
+		if !diags.HasErrors() {
+			t.Fatal("expected error but got none")
+		}
+		expectedErr := "Provider unavailable"
+		if !strings.Contains(diags.Err().Error(), expectedErr) {
+			t.Fatalf("expected error to include %q but it is missing: %q",
+				expectedErr,
+				diags.Err())
+		}
+		if factory != nil {
+			t.Fatal("unexpected factory returned")
+		}
+	})
+}
+
 func testMetaBackend(t *testing.T, args []string) *Meta {
 	var m Meta
 	m.Ui = new(cli.MockUi)
