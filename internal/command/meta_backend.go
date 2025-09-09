@@ -1552,7 +1552,7 @@ func (m *Meta) prepareBackend(root *configs.Module) (backendrun.OperationsBacken
 			return nil, diags
 		}
 
-		// TODO - Use locks from here in opts below
+		// TODO(SarahFrench/radeksimko): Use locks from here in opts below
 		_, lDiags := m.lockedDependencies()
 		diags = diags.Append(lDiags)
 		if lDiags.HasErrors() {
@@ -1562,7 +1562,7 @@ func (m *Meta) prepareBackend(root *configs.Module) (backendrun.OperationsBacken
 		opts = &BackendOpts{
 			StateStoreConfig: root.StateStore,
 			ProviderFactory:  factory,
-			// TODO - update once other work is merged into main
+			// TODO(SarahFrench/radeksimko): update once other work is merged into main
 			// Locks:            locks,
 		}
 	default:
