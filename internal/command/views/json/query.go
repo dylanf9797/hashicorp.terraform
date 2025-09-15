@@ -5,6 +5,7 @@ package json
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/genconfig"
@@ -19,13 +20,14 @@ type QueryStart struct {
 }
 
 type QueryResult struct {
-	Address        string                     `json:"address"`
-	DisplayName    string                     `json:"display_name"`
-	Identity       map[string]json.RawMessage `json:"identity"`
-	ResourceType   string                     `json:"resource_type"`
-	ResourceObject map[string]json.RawMessage `json:"resource_object,omitempty"`
-	Config         string                     `json:"config,omitempty"`
-	ImportConfig   string                     `json:"import_config,omitempty"`
+	Address         string                     `json:"address"`
+	DisplayName     string                     `json:"display_name"`
+	Identity        map[string]json.RawMessage `json:"identity"`
+	IdentityVersion string                     `json:"identity_version"`
+	ResourceType    string                     `json:"resource_type"`
+	ResourceObject  map[string]json.RawMessage `json:"resource_object,omitempty"`
+	Config          string                     `json:"config,omitempty"`
+	ImportConfig    string                     `json:"import_config,omitempty"`
 }
 
 type QueryComplete struct {
@@ -34,21 +36,22 @@ type QueryComplete struct {
 	Total        int    `json:"total"`
 }
 
-func NewQueryStart(addr addrs.AbsResourceInstance, input_config cty.Value) QueryStart {
+func NewQueryStart(addr addrs.AbsResourceInstance, inputConfig cty.Value) QueryStart {
 	return QueryStart{
 		Address:      addr.String(),
 		ResourceType: addr.Resource.Resource.Type,
-		InputConfig:  marshalValues(input_config),
+		InputConfig:  marshalValues(inputConfig),
 	}
 }
 
-func NewQueryResult(listAddr addrs.AbsResourceInstance, value cty.Value, generated *genconfig.ResourceImport) QueryResult {
+func NewQueryResult(listAddr addrs.AbsResourceInstance, value cty.Value, identityVersion int64, generated *genconfig.ResourceImport) QueryResult {
 	result := QueryResult{
-		Address:        listAddr.String(),
-		DisplayName:    value.GetAttr("display_name").AsString(),
-		Identity:       marshalValues(value.GetAttr("identity")),
-		ResourceType:   listAddr.Resource.Resource.Type,
-		ResourceObject: marshalValues(value.GetAttr("state")),
+		Address:         listAddr.String(),
+		DisplayName:     value.GetAttr("display_name").AsString(),
+		Identity:        marshalValues(value.GetAttr("identity")),
+		IdentityVersion: fmt.Sprint(identityVersion),
+		ResourceType:    listAddr.Resource.Resource.Type,
+		ResourceObject:  marshalValues(value.GetAttr("state")),
 	}
 
 	if generated != nil {
